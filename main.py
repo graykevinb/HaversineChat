@@ -16,6 +16,7 @@ Features
   and then asks the model to **summarise** the page.  If the model still says
   nothing, the cleaned‑up text is shown in a fenced block so you never get an empty
   reply.
+* **New:** Results from `google_search` are rendered immediately as markdown.
 * Rich UI: markdown, syntax‑highlighted code, **LaTeX → Unicode** rendering.
 * Google Search API key and Custom Search Engine ID are taken from environment
   variables `GOOGLE_API_KEY` and `GOOGLE_CSE_ID`.
@@ -176,15 +177,11 @@ def html_to_text(html: str, max_chars: int = 2000) -> str:
     """
     from bs4 import BeautifulSoup, Comment
 
-    # ----------------------------------------------------------------------
-    # Choose parser – try lxml first, fall back to the builtin parser.
-    # ----------------------------------------------------------------------
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:               # lxml not installed or parsing failed
         soup = BeautifulSoup(html, "html.parser")
 
-    # ---------- Remove unwanted tags ----------
     for tag_name in [
         "script",
         "style",
@@ -203,18 +200,16 @@ def html_to_text(html: str, max_chars: int = 2000) -> str:
         for tag in soup.find_all(tag_name):
             tag.decompose()
 
-    # ---------- Remove comments ----------
     for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
         comment.extract()
 
-    # ---------- Extract raw text ----------
     text = soup.get_text(separator=" ", strip=True)
     text = re.sub(r"\s+", " ", text)
 
-    # ---------- Trim ----------
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "…"
     return text
+
 
 def google_search(query: str, num_results: int = 5) -> str:
     """
@@ -527,14 +522,7 @@ def chat_loop(
         for name, meta in tool_registry.items()
     )
 
-    # Insert the system prompt into the conversation history
-    messages.append(
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT,
-        }
-    )
-    # -------------------------------------------------------------------------
+    messages.append({"role": "system", "content": SYSTEM_PROMPT})
 
     console.print("\n💬  OpenRouter chat – type your message, `exit` to quit.")
     console.print(
@@ -544,7 +532,7 @@ def chat_loop(
     tools_supported = enable_tools
 
     while True:
-        # ----------------------- Get user input (Prompt‑Toolkit) -----------------------
+        # ----------------------- Get user input -----------------------
         try:
             user_input = session.prompt("👤 You: ").strip()
         except (KeyboardInterrupt, EOFError):
@@ -624,6 +612,17 @@ def chat_loop(
             if func_name == "fetch_url":
                 model_visible_result = html_to_text(tool_result)
 
+            # ------------------------------------------------------------------
+            # Special handling for tools that should **immediately** be shown
+            # ------------------------------------------------------------------
+            if func_name == "google_search":
+                # Show the Google results straight away (markdown rendering)
+                rich_print(model_visible_result, prefix="🔍")
+                messages.append(
+                    {"role": "assistant", "content": model_visible_result}
+                )
+                continue  # back to top of loop – no follow‑up LLM call needed
+
             # Insert tool result into the conversation (the model sees the cleaned text)
             messages.append(
                 {
@@ -650,16 +649,11 @@ def chat_loop(
                 # Special handling for fetch_url: guarantee a summary
                 # --------------------------------------------------------------
                 if func_name == "fetch_url":
-                    # First try the normal follow‑up answer
                     final_answer = follow_up.choices[0].message.content
-
-                    # If the model gave nothing, ask explicitly for a 2‑3‑sentence summary
                     if not final_answer or not final_answer.strip():
                         final_answer = _fallback_summary(
                             model_visible_result, client, model, extra_headers
                         )
-
-                    # If still nothing (should never happen), dump the cleaned text ourselves
                     if not final_answer or not final_answer.strip():
                         fallback = (
                             f"(Tool `{func_name}` result)\n"
@@ -669,7 +663,6 @@ def chat_loop(
                         messages.append({"role": "assistant", "content": fallback})
                         continue
 
-                    # Normal path – print the (now guaranteed) answer
                     final_answer = final_answer.strip()
                     rich_print(final_answer)
                     messages.append({"role": "assistant", "content": final_answer})
@@ -677,7 +670,6 @@ def chat_loop(
 
                 # ----------------------- Non‑fetch tool paths -----------------------
                 if final_answer is None or not final_answer.strip():
-                    # Empty reply – just show the tool output so the user sees something
                     fallback = (
                         f"(Tool `{func_name}` result)\n"
                         f"```text\n{model_visible_result}\n```"
