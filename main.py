@@ -12,6 +12,10 @@ Features
 * Strong system prompt with concrete usage examples.
 * If the model calls `python_execute` without a `code` argument,
   the assistant asks the model to supply the missing snippet.
+* When `fetch_url` is used, the assistant automatically converts HTML → plain text
+  and then asks the model to **summarise** the page.  If the model still says
+  nothing, the cleaned‑up text is shown in a fenced block so you never get an empty
+  reply.
 * Rich UI: markdown, syntax‑highlighted code, **LaTeX → Unicode** rendering.
 * Google Search API key and Custom Search Engine ID are taken from environment
   variables `GOOGLE_API_KEY` and `GOOGLE_CSE_ID`.
@@ -50,6 +54,22 @@ def load_config() -> Dict[str, Any]:
             print(f"⚠️  Could not read config: {e}", file=sys.stderr)
     return {}
 
+
+# ----------------------------------------------------------------------
+# OPTIONAL IMPORT HELPER – ensures bs4 is available
+# ----------------------------------------------------------------------
+def _ensure_bs4():
+    """Install beautifulsoup4 on‑the‑fly if it is missing."""
+    try:
+        import bs4  # noqa: F401
+    except ImportError:  # pragma: no cover
+        import subprocess, sys
+
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "beautifulsoup4"])
+        import bs4  # noqa: F401
+
+
+_ensure_bs4()
 
 # ----------------------------------------------------------------------
 # ARGPARSE
@@ -104,7 +124,7 @@ def search_gutenberg_books(search_terms: List[str]) -> str:
             resp = requests.get(base, params={"search": term}, timeout=10)
             resp.raise_for_status()
             data = resp.json()
-            books = data.get("results", [])[:5]          # up to 5 results per term
+            books = data.get("results", [])[:5]  # up to 5 results per term
             titles = [b.get("title", "Untitled") for b in books]
             lines.append(f'🔎 "{term}" → ' + ", ".join(titles))
         except Exception as exc:
@@ -123,32 +143,83 @@ def python_execute(code: str) -> str:
     stdout = io.StringIO()
     try:
         with contextlib.redirect_stdout(stdout):
-            print(debug_line, end="")          # echo the snippet first
-            exec(code, {}, {})                # unrestricted exec
+            print(debug_line, end="")  # echo the snippet first
+            exec(code, {}, {})  # unrestricted exec
         result = stdout.getvalue().strip()
         return result if result else "(no output)"
     except Exception:
         tb = traceback.format_exc()
-        # Return only the last two lines of the traceback for brevity
         return f"❌ python_execute raised an exception:\n{tb.splitlines()[-2:]}"
 
 
 def fetch_url(url: str, timeout: int = 10) -> str:
-    """Fetch the raw text content of a URL (GET request)."""
+    """Fetch the raw HTML of a URL via GET."""
     try:
-        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "OpenRouterChat/1.0"})
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "OpenRouterChat/1.0"},
+        )
         resp.raise_for_status()
-        # Return the first 2000 characters to avoid flooding the chat
-        content = resp.text
-        return content[:2000] + ("…" if len(content) > 2000 else "")
+        return resp.text
     except Exception as exc:
         return f"⚠️  Failed to fetch {url!r}: {exc}"
 
 
+def html_to_text(html: str, max_chars: int = 2000) -> str:
+    """
+    Convert HTML → clean plain‑text.
+    - Removes script / style / noscript / svg / head / header / footer tags.
+    - Strips HTML comments.
+    - Collapses whitespace.
+    - Truncates to *max_chars* characters (adds an ellipsis if trimmed).
+    """
+    from bs4 import BeautifulSoup, Comment
+
+    # ----------------------------------------------------------------------
+    # Choose parser – try lxml first, fall back to the builtin parser.
+    # ----------------------------------------------------------------------
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:               # lxml not installed or parsing failed
+        soup = BeautifulSoup(html, "html.parser")
+
+    # ---------- Remove unwanted tags ----------
+    for tag_name in [
+        "script",
+        "style",
+        "noscript",
+        "svg",
+        "head",
+        "header",
+        "footer",
+        "meta",
+        "link",
+        "iframe",
+        "form",
+        "input",
+        "button",
+    ]:
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
+
+    # ---------- Remove comments ----------
+    for comment in soup.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+
+    # ---------- Extract raw text ----------
+    text = soup.get_text(separator=" ", strip=True)
+    text = re.sub(r"\s+", " ", text)
+
+    # ---------- Trim ----------
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    return text
+
 def google_search(query: str, num_results: int = 5) -> str:
     """
     Perform a Google Custom Search.
-    Requires the environment variables ``GOOGLE_API_KEY`` and ``GOOGLE_CSE_ID``.
+    Requires the env vars ``GOOGLE_API_KEY`` and ``GOOGLE_CSE_ID``.
     Returns a short, readable list of result titles and snippets.
     """
     api_key = os.getenv("GOOGLE_API_KEY")
@@ -165,7 +236,7 @@ def google_search(query: str, num_results: int = 5) -> str:
         "key": api_key,
         "cx": cse_id,
         "q": query,
-        "num": min(max(num_results, 1), 10),   # Google caps at 10 per request
+        "num": min(max(num_results, 1), 10),  # Google caps at 10 per request
     }
 
     try:
@@ -226,7 +297,7 @@ tool_registry = {
     },
     "fetch_url": {
         "func": fetch_url,
-        "description": "Fetch the raw text content of a URL (GET request).",
+        "description": "Fetch the raw HTML of a URL (GET request).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -291,39 +362,24 @@ def build_function_definitions() -> List[Dict[str, Any]]:
 # LaTeX → Unicode renderer (SymPy)
 # ----------------------------------------------------------------------
 def _pretty_latex(expr: str) -> str:
-    """
-    Convert a LaTeX expression to a pretty‑printed Unicode string.
-    If parsing fails, the original LaTeX (without delimiters) is returned unchanged.
-    """
+    """Convert LaTeX → pretty Unicode; fall back to raw LaTeX on error."""
     try:
         sym_expr = parse_latex(expr)
         return pretty(sym_expr, use_unicode=True)
     except Exception:
-        # Return the raw LaTeX (no surrounding $…$)
         return expr
 
 
 def render_latex_in_text(text: str) -> str:
-    """
-    Replace LaTeX delimiters with pretty‑printed Unicode.
-    Supports:
-
-        $…$, $$…$$, \\(...\\), \\[...\\]
-
-    The delimiters are removed – only the pretty‑printed math remains.
-    If a fragment cannot be parsed, it is left as‑is (so the user still sees it).
-    """
-    # display math first
+    """Replace LaTeX delimiters with pretty‑printed Unicode."""
     def repl_display(m):
         expr = m.group(1).strip()
         return "\n" + _pretty_latex(expr) + "\n"
 
-    # inline math
     def repl_inline(m):
         expr = m.group(1).strip()
         return _pretty_latex(expr)
 
-    # order matters: longer delimiters first
     text = re.sub(r'\\\[(.+?)\\\]', repl_display, text, flags=re.DOTALL)
     text = re.sub(r'\$\$(.+?)\$\$', repl_display, text, flags=re.DOTALL)
     text = re.sub(r'\\\((.+?)\\\)', repl_inline, text)
@@ -340,19 +396,63 @@ session = PromptSession()   # replaces built‑in input()
 
 def rich_print(text: str, prefix: str = "🤖"):
     """
-    Render markdown (including LaTeX‑converted math) and code fences.
-    The first line receives the prefix.
+    Render markdown (including LaTeX) and code fences.
+    If the text looks like raw HTML, treat it as plain text.
     """
-    # 1️⃣  Convert LaTeX → Unicode
     text = render_latex_in_text(text)
 
-    # 2️⃣  Render the rest as markdown; Rich handles code fences, tables, etc.
+    # Simple HTML detection – if we see any <tag>, just print as plain text.
+    if re.search(r'<[^>]+>', text):
+        lines = text.splitlines()
+        if lines:
+            console.print(f"{prefix} {lines[0]}")
+            if len(lines) > 1:
+                console.print("\n".join(lines[1:]))
+        else:
+            console.print(f"{prefix} (empty)")
+        return
+
+    # Normal markdown rendering
     lines = text.splitlines()
     if not lines:
         return
     console.print(f"{prefix} {lines[0]}")
     if len(lines) > 1:
         console.print(Markdown("\n".join(lines[1:]), code_theme="monokai"))
+
+
+# ----------------------------------------------------------------------
+# Helper: deterministic fallback summary for fetch_url
+# ----------------------------------------------------------------------
+def _fallback_summary(
+    text: str, client: OpenAI, model: str, extra_headers: dict
+) -> str:
+    """
+    Ask the LLM once more with an explicit “summarise in 2‑3 sentences”
+    prompt.  If that still returns nothing, return a concise raw excerpt.
+    """
+    prompt = (
+        "Please give a concise 2‑sentence summary of the following page content. "
+        "Do not add any commentary, just the summary.\n\n"
+        f"=== PAGE CONTENT ===\n{text}\n=== END ==="
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            extra_headers=extra_headers,
+            temperature=0.0,
+        )
+        summary = resp.choices[0].message.content
+        if summary and summary.strip():
+            return summary.strip()
+    except Exception:
+        pass
+    # Last‑ditch fallback
+    return (
+        f"(No summary could be generated – here is the raw excerpt)\n"
+        f"```text\n{text}\n```"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -389,7 +489,7 @@ def chat_loop(
                 "User: give me three romance books from Gutenberg\n"
                 "Assistant: (calls `search_gutenberg_books` with arguments "
                 "{\"search_terms\": [\"romance\"]})\n"
-                "User: fetch the front page of example.com\n"
+                "User: fetch the front page of https://example.com\n"
                 "Assistant: (calls `fetch_url` with arguments {\"url\": \"https://example.com\"})\n"
                 "User: search for Python tutorials on Google\n"
                 "Assistant: (calls `google_search` with arguments "
@@ -405,7 +505,9 @@ def chat_loop(
     # -------------------------------------------------------------------------
 
     console.print("\n💬  OpenRouter chat – type your message, `exit` to quit.")
-    console.print("   (Tools are enabled)" if enable_tools else "   (Tools are disabled)")
+    console.print(
+        "   (Tools are enabled)" if enable_tools else "   (Tools are disabled)"
+    )
 
     tools_supported = enable_tools
 
@@ -485,13 +587,18 @@ def chat_loop(
                     tb = traceback.format_exc()
                     tool_result = f"❌ Error while executing `{func_name}`:\n{tb}"
 
-            # Insert tool result into conversation
+            # For fetch_url we want the *plain‑text* version that the model will see.
+            model_visible_result = tool_result
+            if func_name == "fetch_url":
+                model_visible_result = html_to_text(tool_result)
+
+            # Insert tool result into the conversation (the model sees the cleaned text)
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": tool_call.id,
                     "name": func_name,
-                    "content": tool_result,
+                    "content": model_visible_result,
                 }
             )
 
@@ -505,9 +612,51 @@ def chat_loop(
                         extra_headers=extra_headers,
                         temperature=0.7,
                     )
-                final_answer = follow_up.choices[0].message.content.strip()
-                rich_print(final_answer)
-                messages.append({"role": "assistant", "content": final_answer})
+                final_answer = follow_up.choices[0].message.content
+
+                # --------------------------------------------------------------
+                # Special handling for fetch_url: guarantee a summary
+                # --------------------------------------------------------------
+                if func_name == "fetch_url":
+                    # First try the normal follow‑up answer
+                    final_answer = follow_up.choices[0].message.content
+
+                    # If the model gave nothing, ask explicitly for a 2‑3‑sentence summary
+                    if not final_answer or not final_answer.strip():
+                        final_answer = _fallback_summary(
+                            model_visible_result, client, model, extra_headers
+                        )
+
+                    # If still nothing (should never happen), dump the cleaned text ourselves
+                    if not final_answer or not final_answer.strip():
+                        fallback = (
+                            f"(Tool `{func_name}` result)\n"
+                            f"```text\n{model_visible_result}\n```"
+                        )
+                        rich_print(fallback)
+                        messages.append({"role": "assistant", "content": fallback})
+                        continue
+
+                    # Normal path – print the (now guaranteed) answer
+                    final_answer = final_answer.strip()
+                    rich_print(final_answer)
+                    messages.append({"role": "assistant", "content": final_answer})
+                    continue  # go back to top of loop
+
+                # ----------------------- Non‑fetch tool paths -----------------------
+                if final_answer is None or not final_answer.strip():
+                    # Empty reply – just show the tool output so the user sees something
+                    fallback = (
+                        f"(Tool `{func_name}` result)\n"
+                        f"```text\n{model_visible_result}\n```"
+                    )
+                    rich_print(fallback)
+                    messages.append({"role": "assistant", "content": fallback})
+                else:
+                    final_answer = final_answer.strip()
+                    rich_print(final_answer)
+                    messages.append({"role": "assistant", "content": final_answer})
+
             except Exception as exc:
                 console.print(f"\n❌ Follow‑up API error: {exc}\n")
             continue
