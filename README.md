@@ -1,5 +1,16 @@
 ## Setup
-``` uv install ```
+``` uv install && source .venv/bin/activate```
+
+Recommended command to run
+
+```python3 main.py --model openai/gpt-oss-120b:exacto```
+
+Add your API keys. 
+Setting up the google one is super easy just go here follow the instructions. https://developers.google.com/custom-search/v1/overview
+```
+export OPENROUTER_API_KEY=""
+export GOOGLE_API_KEY=""
+```
 
 ## Usage Examples
 
