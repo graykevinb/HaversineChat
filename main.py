@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 """
-OpenRouter CLI chat with tool (function) calling support.
-All Groq‑related work‑arounds have been removed.
+OpenRouter CLI chat with function‑calling (MCP).
 
-Example usage:
+Features
+--------
+* Two tools:
+    - search_gutenberg_books – search Project Gutenberg (Gutendex API)
+    - python_execute        – run a short Python snippet in a sandbox
+* Strong system prompt with concrete usage examples.
+* When the model calls `python_execute` without a `code` argument the script
+  tries to locate a *valid* Python snippet in the conversation history
+  (using ast.parse).  If none is found a helpful error is returned.
+* Optional `--provider` flag to force a specific OpenRouter backend.
+* No regex‑based shortcuts – the assistant decides when to call a tool.
+
+Usage
+-----
     export OPENROUTER_API_KEY="sk-..."
     python openrouter_cli_tool.py \
-        --model google/gemini-2.0-flash-001 \
-        --provider deepinfra   # optional – you can also embed the provider in the model ID
+        --model openai/gpt-4o                # any function‑calling model
+        --provider deepinfra                  # optional, force a provider
+        --no-tools                           # optional, disable tools
 """
 
 import argparse
+import ast
 import json
 import os
 import sys
@@ -30,7 +44,7 @@ CONFIG_PATH = Path.home() / ".openrouter_chat.json"
 
 
 def load_config() -> Dict[str, Any]:
-    """Read optional JSON config from ~/.openrouter_chat.json."""
+    """Load optional JSON config from ~/.openrouter_chat.json."""
     if CONFIG_PATH.is_file():
         try:
             return json.load(open(CONFIG_PATH, "r", encoding="utf-8"))
@@ -40,7 +54,7 @@ def load_config() -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------
-# CLI ARGUMENTS
+# ARGPARSE
 # ----------------------------------------------------------------------
 def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -53,15 +67,15 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--model",
-        default=defaults.get("model", "google/gemini-2.0-flash-001"),
-        help="Model ID, e.g. google/gemini-2.0-flash-001",
+        default=defaults.get("model", "openai/gpt-4o"),
+        help="Model ID, e.g. openai/gpt-4o",
     )
     p.add_argument(
         "--provider",
         default=defaults.get("provider", ""),
         help=(
             "Provider slug (openrouter, groq, deepinfra, etc.). "
-            "If given, the final model identifier becomes <provider>/<model>."
+            "If given, final model ID becomes <provider>/<model>."
         ),
     )
     p.add_argument(
@@ -91,32 +105,29 @@ def build_parser(defaults: Dict[str, Any]) -> argparse.ArgumentParser:
 # TOOL IMPLEMENTATIONS
 # ----------------------------------------------------------------------
 def search_gutenberg_books(search_terms: List[str]) -> str:
-    """
-    Very small wrapper around the free Gutendex API
-    (https://gutendex.com).  For each search term it returns the
-    first few titles that match.
-    """
+    """Search Project Gutenberg via the public Gutendex API."""
     base = "https://gutendex.com/books"
-    all_titles = []
+    lines = []
 
     for term in search_terms:
         try:
             resp = requests.get(base, params={"search": term}, timeout=10)
             resp.raise_for_status()
             data = resp.json()
-            books = data.get("results", [])[:5]  # take up to 5 per term
+            books = data.get("results", [])[:5]  # up to 5 results per term
             titles = [b.get("title", "Untitled") for b in books]
-            all_titles.append(f'🔎 "{term}" → ' + ", ".join(titles))
+            lines.append(f'🔎 "{term}" → ' + ", ".join(titles))
         except Exception as exc:
-            all_titles.append(f'⚠️  error searching "{term}": {exc}')
+            lines.append(f'⚠️  error searching "{term}": {exc}')
 
-    # Return a single string that the LLM can read easily
-    return "\n".join(all_titles) or "No books found."
+    return "\n".join(lines) or "No books found."
+
 
 def python_execute(code: str) -> str:
     """
-    Execute a short Python snippet in a sandbox and return its stdout.
-    The sandbox only exposes a tiny whitelist of built‑ins.
+    Execute a short Python snippet in a sandbox.
+    Only a tiny whitelist of built‑ins is exposed.
+    Returns stdout or a concise traceback on error.
     """
     import io
     import contextlib
@@ -135,27 +146,24 @@ def python_execute(code: str) -> str:
         "print": print,
     }
 
-    # ------------------------------------------------------------------
-    # Your explicit debugging line – this will appear in the tool result
-    # ------------------------------------------------------------------
+    # Debug line – will appear in the tool output.
     debug_line = f"Executing Python code:\n{code}\n"
-    # ------------------------------------------------------------------
 
     stdout = io.StringIO()
     try:
         with contextlib.redirect_stdout(stdout):
-            # Print the debug line first
-            print(debug_line, end="")          # `end=""` so we don’t add an extra newline
-            # Then actually run the user code
+            print(debug_line, end="")          # show the debug line first
             exec(code, {"__builtins__": safe_builtins}, {})
         result = stdout.getvalue().strip()
         return result if result else "(no output)"
     except Exception:
         tb = traceback.format_exc()
+        # Show only the last line of the traceback (the actual error message).
         return f"❌ python_execute raised an exception:\n{tb.splitlines()[-2:]}"
 
+
 # ----------------------------------------------------------------------
-# TOOL REGISTRY (name → implementation + schema)
+# TOOL REGISTRY (name → implementation + JSON schema)
 # ----------------------------------------------------------------------
 tool_registry = {
     "search_gutenberg_books": {
@@ -172,7 +180,8 @@ tool_registry = {
             },
             "required": ["search_terms"],
         },
-        "python_execute": {
+    },
+    "python_execute": {
         "func": python_execute,
         "description": "Execute a short Python snippet (no network, no file I/O).",
         "parameters": {
@@ -189,29 +198,14 @@ tool_registry = {
             "required": ["code"],
         },
     },
-    },
-    # You can add more tools here, following the same pattern.
 }
 
 
 def build_function_definitions() -> List[Dict[str, Any]]:
-    """
-    Turn the `tool_registry` into the JSON structure OpenRouter expects:
-    [
-        {
-            "type": "function",
-            "function": {
-                "name": "...",
-                "description": "...",
-                "parameters": {...}
-            }
-        },
-        …
-    ]
-    """
-    definitions = []
+    """Convert the registry into the OpenAI‑compatible function list."""
+    defs = []
     for name, meta in tool_registry.items():
-        definitions.append(
+        defs.append(
             {
                 "type": "function",
                 "function": {
@@ -221,14 +215,35 @@ def build_function_definitions() -> List[Dict[str, Any]]:
                 },
             }
         )
-    return definitions
+    return defs
 
 
 # ----------------------------------------------------------------------
-# UI HELPERS
+# Helper: try to find a *valid* Python snippet in the conversation history
+# ----------------------------------------------------------------------
+def extract_code_from_user(messages: List[Dict[str, Any]]) -> str | None:
+    """
+    Scan past user messages (most recent first) and return the first one
+    that parses successfully with `ast.parse`.  Returns None if nothing
+    parses.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        txt = msg.get("content", "")
+        try:
+            ast.parse(txt, mode="exec")
+            return txt
+        except Exception:
+            continue
+    return None
+
+
+# ----------------------------------------------------------------------
+# UI helpers
 # ----------------------------------------------------------------------
 class Spinner:
-    """Simple tqdm‑based spinner while we wait for the remote model."""
+    """Simple tqdm spinner while waiting for the remote model."""
 
     def __enter__(self):
         self.tq = tqdm(total=0, bar_format="⏳ {desc}", leave=False, colour="cyan")
@@ -248,7 +263,7 @@ def wrap_print(text: str, prefix: str = "🤖"):
 
 
 # ----------------------------------------------------------------------
-# CHAT LOOP
+# MAIN chat loop
 # ----------------------------------------------------------------------
 def chat_loop(
     client: OpenAI,
@@ -256,20 +271,28 @@ def chat_loop(
     extra_headers: Dict[str, str],
     enable_tools: bool,
 ) -> None:
+    """Interactive REPL that can call the registered tools."""
     messages: List[Dict[str, Any]] = []
 
-    # --------------------------------------------------------------
-    # System prompt – you can keep the one you already have
-    # --------------------------------------------------------------
+    # ------------------- System prompt (explicit, with examples) -------------------
     messages.append(
         {
             "role": "system",
             "content": (
                 "You are a helpful assistant. "
-                "When the user asks for a Python calculation or any code, you MUST call the function "
-                "`python_execute` with a single argument `code` (a short Python snippet). "
-                "When the user asks for book titles, call `search_gutenberg_books`. "
-                "If the request does not need a tool, answer normally.\n\n"
+                "When the user provides a Python snippet you **must** call the function "
+                "`python_execute` with a single argument `code` containing that snippet. "
+                "If the user merely describes a calculation without giving code, answer "
+                "normally or ask for the snippet – do not call the tool with empty code. "
+                "When the user asks for book titles you **must** call "
+                "`search_gutenberg_books` with an array of search terms. "
+                "If the request does not need a tool, answer directly.\n\n"
+                "Correct usage examples (the assistant should follow this pattern):\n"
+                "User: execute 2**8 in python\n"
+                "Assistant: (calls `python_execute` with arguments {\"code\": \"print(2**8)\"})\n"
+                "User: give me three romance books from Gutenberg\n"
+                "Assistant: (calls `search_gutenberg_books` with arguments "
+                "{\"search_terms\": [\"romance\"]})\n\n"
                 "Available tools:\n"
                 + "\n".join(
                     f"- {name}: {meta['description']}"
@@ -278,6 +301,7 @@ def chat_loop(
             ),
         }
     )
+    # ---------------------------------------------------------------------------
 
     print("\n💬  OpenRouter chat – type your message, `exit` to quit.")
     print("   (Tools are enabled)" if enable_tools else "   (Tools are disabled)")
@@ -285,9 +309,7 @@ def chat_loop(
     tools_supported = enable_tools
 
     while True:
-        # ----------------------------------------------------------
-        # get user input
-        # ----------------------------------------------------------
+        # ----------------------- Get user input -----------------------
         try:
             user_input = input("👤 You: ").strip()
         except (KeyboardInterrupt, EOFError):
@@ -300,11 +322,10 @@ def chat_loop(
         if not user_input:
             continue
 
+        # Add the user message to history
         messages.append({"role": "user", "content": user_input})
 
-        # ----------------------------------------------------------
-        # first request (with tools if enabled)
-        # ----------------------------------------------------------
+        # ----------------------- First request -----------------------
         request_kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -320,26 +341,54 @@ def chat_loop(
                 resp = client.chat.completions.create(**request_kwargs)
         except Exception as exc:
             print(f"\n❌ API error: {exc}\n")
-            messages.pop()          # drop the last user message
+            # discard the user message so they can retry
+            messages.pop()
             continue
 
         choice = resp.choices[0]
 
-        # ----------------------------------------------------------
-        # Did the model ask for a tool?
-        # ----------------------------------------------------------
+        # ----------------------- Did the model request a tool? -----------------------
         if choice.message.tool_calls:
-            tool_call = choice.message.tool_calls[0]          # only one per turn
+            tool_call = choice.message.tool_calls[0]
             func_name = tool_call.function.name
-            raw_args   = tool_call.function.arguments
+            raw_args = tool_call.function.arguments
 
+            # Parse the JSON arguments (may be empty)
             try:
-                args = json.loads(raw_args)
+                args = json.loads(raw_args) if raw_args else {}
             except Exception:
                 args = {}
 
+            # -------------------------------------------------------------
+            # Special handling for python_execute when `code` is missing.
+            # -------------------------------------------------------------
+            if func_name == "python_execute" and not args.get("code"):
+                inferred = extract_code_from_user(messages)
+                if inferred:
+                    args["code"] = inferred
+                else:
+                    # Friendly fallback – tell the user we need proper code.
+                    tool_result = (
+                        "❌ The assistant tried to call `python_execute` but no valid "
+                        "Python code was supplied. Please provide a short Python snippet "
+                        "(e.g. `print(2**8)`)."
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": func_name,
+                            "content": tool_result,
+                        }
+                    )
+                    wrap_print(tool_result, prefix="🤖")
+                    # Skip the second request – we already have an answer.
+                    continue
+            # -------------------------------------------------------------
+
             print(f"\n🛠️  Model wants to run `{func_name}` with args {args}")
 
+            # ----------------------- Run the local implementation -----------------------
             if func_name not in tool_registry:
                 tool_result = f"❌ Unknown tool `{func_name}`."
             else:
@@ -349,9 +398,7 @@ def chat_loop(
                     tb = traceback.format_exc()
                     tool_result = f"❌ Error while executing `{func_name}`:\n{tb}"
 
-            # ------------------------------------------------------
-            # **Correct** way to add the tool result to the conversation
-            # ------------------------------------------------------
+            # Insert the tool result back into the conversation.
             messages.append(
                 {
                     "role": "tool",
@@ -360,11 +407,8 @@ def chat_loop(
                     "content": tool_result,
                 }
             )
-            # (no extra empty assistant message is needed)
 
-            # ------------------------------------------------------
-            # second request – model now sees the tool output
-            # ------------------------------------------------------
+            # ----------------------- Second request (model sees tool output) -----------------------
             try:
                 with Spinner():
                     follow_up = client.chat.completions.create(
@@ -380,30 +424,25 @@ def chat_loop(
                 print(f"\n❌ Follow‑up API error: {exc}\n")
             continue
 
-        # ----------------------------------------------------------
-        # No tool call – plain text response
-        # ----------------------------------------------------------
+        # ----------------------- Plain text reply (no tool) -----------------------
         answer = choice.message.content.strip()
         wrap_print(answer)
         messages.append({"role": "assistant", "content": answer})
 
 
 # ----------------------------------------------------------------------
-# MAIN ENTRY POINT
+# ENTRY POINT
 # ----------------------------------------------------------------------
 def main() -> None:
     cfg = load_config()
     parser = build_parser(cfg)
     args = parser.parse_args()
 
-    # --------------------------------------------------------------
-    # Build the final model identifier (provider optional)
-    # --------------------------------------------------------------
+    # Build the final model identifier (optional provider prefix)
     if args.provider:
         model_id = f"{args.provider}/{args.model}"
     else:
         model_id = args.model
-    # --------------------------------------------------------------
 
     if not args.api_key:
         parser.error(
