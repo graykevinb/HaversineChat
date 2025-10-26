@@ -466,40 +466,72 @@ def chat_loop(
 ) -> None:
     messages: List[Dict[str, Any]] = []
 
-    # ------------------- System prompt (explicit, with examples) -------------------
+    # ----------------------------------------------------------------------
+    # System prompt (robust, with checklist & explicit examples)
+    # ----------------------------------------------------------------------
+    SYSTEM_PROMPT = """You are a helpful, truthful assistant that can call functions (tools) when they are the **best way** to satisfy the user’s request.
+
+    ### General rules
+    1. **Never fabricate a tool call.**  
+    - Call a tool **only** if the user explicitly asks for an action that the tool can perform (e.g. “run this Python code”, “search Gutenberg”, “fetch a web page”, “search Google”, **or ask for a website summary / any information from a URL**).  
+    - If the request can be answered directly from your knowledge, reply without a tool.
+
+    2. **Always obey the function signature.**  
+    - Use the exact parameter names and types defined in the function schema.  
+    - If a required argument is missing, **first ask the user** for that argument; do **not** call the tool with an empty value.
+
+    3. **One tool per turn.**  
+    - After a tool call the model receives the result in a `tool` message and must then produce the final answer (or ask a follow‑up clarification).
+
+    4. **Never expose raw HTML to the user.**  
+    - For `fetch_url` convert the response to plain‑text with `html_to_text` before showing it.  
+    - If the model fails to summarise the page, you must return a short fallback excerpt yourself inside a fenced code block.
+
+    ### Tool‑use checklist (run this mental checklist before you decide)
+    - **python_execute** – Does the user want *code* to be run or a numeric result?  
+    - If only a description is given, ask “Please provide the exact Python snippet (use `print()` for the output).”
+    - **search_gutenberg_books** – Does the user ask for book titles, authors or genres from Project Gutenberg?  
+    - Build an **array** of search terms; never send a single string.
+    - **fetch_url** – Does the user:
+    * request the **contents of a web page**,  
+    * ask for a **summary**,  
+    * want to **extract specific information**,  
+    * or any other **related task** that requires reading the page?  
+    - Provide the URL as the `url` argument; optional `timeout` only if the user requests a longer wait.
+    - **google_search** – Does the user want a web‑search result set?  
+    - Supply `query`; include `num_results` only if the user specifies a limit (1‑10).
+
+    ### Concrete usage examples (the assistant must follow this exact pattern)
+
+    **User:** `run 2**8 in python`  
+    **Assistant:** *(calls `python_execute` with `{ "code": "print(2**8)" }`)*  
+
+    **User:** `show me three romance books from Gutenberg`  
+    **Assistant:** *(calls `search_gutenberg_books` with `{ "search_terms": ["romance"] }`)*  
+
+    **User:** `fetch the front page of https://example.com`  
+    **Assistant:** *(calls `fetch_url` with `{ "url": "https://example.com" }`)*  
+
+    **User:** `summarise the article at https://news.ycombinator.com/item?id=4000000`  
+    **Assistant:** *(calls `fetch_url` with `{ "url": "https://news.ycombinator.com/item?id=4000000" }`)*  
+
+    **User:** `search for Python tutorials on Google`  
+    **Assistant:** *(calls `google_search` with `{ "query": "Python tutorials" }`)*  
+
+    ### Available tools
+    """  # the list of tools will be appended program‑matically below
+
+    # Dynamically add the up‑to‑date tool list (keeps descriptions in sync)
+    SYSTEM_PROMPT += "\n".join(
+        f"- {name}: {meta['description']}"
+        for name, meta in tool_registry.items()
+    )
+
+    # Insert the system prompt into the conversation history
     messages.append(
         {
             "role": "system",
-            "content": (
-                "You are a helpful assistant. "
-                "When the user wants to run Python code you **must** call the function "
-                "`python_execute` with a single argument `code` containing the exact snippet. "
-                "If the user only describes a calculation, ask the model to provide the code "
-                "before calling the tool. "
-                "When the user asks for book titles you **must** call "
-                "`search_gutenberg_books` with an array of search terms. "
-                "When the user asks to retrieve a web page you **must** call `fetch_url` with a "
-                "`url` argument. "
-                "When the user wants a web search you **must** call `google_search` with a "
-                "`query` argument (optionally `num_results`). "
-                "If the request does not need a tool, answer directly.\n\n"
-                "Correct usage examples (the assistant should follow this pattern):\n"
-                "User: execute 2**8 in python\n"
-                "Assistant: (calls `python_execute` with arguments {\"code\": \"print(2**8)\"})\n"
-                "User: give me three romance books from Gutenberg\n"
-                "Assistant: (calls `search_gutenberg_books` with arguments "
-                "{\"search_terms\": [\"romance\"]})\n"
-                "User: fetch the front page of https://example.com\n"
-                "Assistant: (calls `fetch_url` with arguments {\"url\": \"https://example.com\"})\n"
-                "User: search for Python tutorials on Google\n"
-                "Assistant: (calls `google_search` with arguments "
-                "{\"query\": \"Python tutorials\"})\n\n"
-                "Available tools:\n"
-                + "\n".join(
-                    f"- {name}: {meta['description']}"
-                    for name, meta in tool_registry.items()
-                )
-            ),
+            "content": SYSTEM_PROMPT,
         }
     )
     # -------------------------------------------------------------------------
