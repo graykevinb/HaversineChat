@@ -5,7 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "antlr4-python3-runtime>=4.13,<4.14",
+    "antlr4-tools>=0.2.2",
     "openai>=2.6.1",
+    "prompt-toolkit>=3.0.52",
     "requests>=2.32.5",
+    "rich>=14.2.0",
+    "sympy>=1.14.0",
     "tqdm>=4.67.1",
 ]
